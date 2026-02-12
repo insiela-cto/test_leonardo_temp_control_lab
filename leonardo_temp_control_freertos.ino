@@ -4,7 +4,7 @@
 
   Implementa dos controladores:
   1) PID clásico (con anti-windup y derivada filtrada)
-  2) Control moderno tipo LQI (realimentación de estado + integrador)
+  2) Control moderno basado en observador + realimentación de estado + integrador (LQI-like)
 
   Librerías necesarias:
   - Arduino_FreeRTOS (https://github.com/feilipu/Arduino_FreeRTOS_Library)
@@ -13,12 +13,16 @@
   - MODE PID
   - MODE MODERN
   - SP <valor_en_C>
+  - PID <kp> <ki> <kd>
+  - MODERN <kx> <ki>
 */
 
 #include <Arduino.h>
 #include <Arduino_FreeRTOS.h>
 #include <semphr.h>
 #include <math.h>
+#include <string.h>
+#include <stdlib.h>
 
 // -------------------- Configuración de hardware --------------------
 static const uint8_t PIN_HEATER_PWM = 3;   // PWM al transistor/MOSFET del calefactor
@@ -29,7 +33,6 @@ static const float TS = 0.2f;  // [s] período de control
 static const TickType_t TASK_PERIOD_TICKS = pdMS_TO_TICKS((uint16_t)(TS * 1000.0f));
 
 // -------------------- Parámetros del sensor (NTC Beta) --------------------
-// Ajustar según tu HW real si es necesario
 static const float R_FIXED = 10000.0f; // resistor fijo del divisor [ohm]
 static const float R0 = 10000.0f;      // resistencia NTC a T0 [ohm]
 static const float T0_K = 298.15f;     // 25°C en Kelvin
@@ -40,7 +43,6 @@ static const float U_MIN = 0.0f;    // 0% potencia
 static const float U_MAX = 100.0f;  // 100% potencia
 static const float DEFAULT_SP = 45.0f;
 
-// -------------------- Selección de controlador --------------------
 enum ControlMode : uint8_t {
   CONTROL_PID = 0,
   CONTROL_MODERN = 1,
@@ -63,11 +65,10 @@ struct PIDController {
   float kp;
   float ki;
   float kd;
-  float tau_d;      // filtro de derivada
+  float tau_d;
   float integ;
   float d_prev;
   float e_prev;
-  float u_prev;
 };
 
 static PIDController gPID = {
@@ -78,29 +79,31 @@ static PIDController gPID = {
   .integ = 0.0f,
   .d_prev = 0.0f,
   .e_prev = 0.0f,
-  .u_prev = 0.0f,
 };
 
-// -------------------- Control moderno (LQI simplificado) --------------------
-// Modelo térmico discreto de primer orden:
-// x[k+1] = a*x[k] + b*u[k], donde x es desviación de temperatura respecto a ambiente
-// Diseño tipo LQI implementado como:
-// xi[k+1] = xi[k] + (r - y)*Ts
-// u = -Kx*x + Ki*xi
+// -------------------- Control moderno (LQI-like) --------------------
+// Modelo térmico: x[k+1] = a*x[k] + b*u[k], y[k] = x[k] + ambiente
+// x_hat se estima con un observador discreto simple.
 struct ModernController {
-  float a;   // dinámica discreta
+  float a;   // dinámica discreta del proceso térmico
   float b;   // ganancia discreta por % de potencia
-  float kx;  // ganancia estado
-  float ki;  // ganancia integrador
+  float l;   // ganancia del observador
+  float kx;  // realimentación de estado
+  float ki;  // ganancia del integrador de error
+  float x_hat;
   float xi;
+  float u_prev;
 };
 
 static ModernController gModern = {
   .a = 0.985f,
   .b = 0.09f,
-  .kx = 1.2f,
-  .ki = 0.35f,
+  .l = 0.25f,
+  .kx = 1.10f,
+  .ki = 0.30f,
+  .x_hat = 0.0f,
   .xi = 0.0f,
+  .u_prev = 0.0f,
 };
 
 static float clampf(const float v, const float lo, const float hi) {
@@ -109,11 +112,7 @@ static float clampf(const float v, const float lo, const float hi) {
 
 static float adcToTempC(const int adc) {
   const float adcSafe = (adc <= 0) ? 1.0f : ((adc >= 1023) ? 1022.0f : (float)adc);
-
-  // Divisor: Vout = Vcc * (R_ntc / (R_fixed + R_ntc))
   const float rNtc = R_FIXED * (adcSafe / (1023.0f - adcSafe));
-
-  // Ecuación Beta
   const float invT = (1.0f / T0_K) + (1.0f / BETA) * logf(rNtc / R0);
   const float tempK = 1.0f / invT;
   return tempK - 273.15f;
@@ -121,11 +120,8 @@ static float adcToTempC(const int adc) {
 
 static float runPID(PIDController &c, const float sp, const float y) {
   const float e = sp - y;
-
-  // Integrador con anti-windup por clamping condicional
   const float integCandidate = c.integ + c.ki * TS * e;
 
-  // Derivada filtrada
   const float de = (e - c.e_prev) / TS;
   const float alpha = c.tau_d / (c.tau_d + TS);
   const float d = alpha * c.d_prev + (1.0f - alpha) * de;
@@ -133,7 +129,6 @@ static float runPID(PIDController &c, const float sp, const float y) {
   float uUnsat = c.kp * e + integCandidate + c.kd * d;
   float uSat = clampf(uUnsat, U_MIN, U_MAX);
 
-  // Si no saturo, o si la integración ayuda a salir de saturación, aceptamos integrador
   const bool satHigh = (uUnsat > U_MAX);
   const bool satLow = (uUnsat < U_MIN);
   const bool integrate = (!satHigh && !satLow) || (satHigh && e < 0.0f) || (satLow && e > 0.0f);
@@ -146,27 +141,26 @@ static float runPID(PIDController &c, const float sp, const float y) {
 
   c.e_prev = e;
   c.d_prev = d;
-  c.u_prev = uSat;
   return uSat;
 }
 
 static float runModern(ModernController &c, const float sp, const float y, const float ambient) {
-  const float x = y - ambient;          // estado medido (desviación térmica)
-  const float r = sp - ambient;         // referencia equivalente
-  const float e = r - x;
+  const float yState = y - ambient;
 
-  // Integrador del error
+  // Observador de estado (usa modelo + corrección por error de medición)
+  c.x_hat = c.a * c.x_hat + c.b * c.u_prev + c.l * (yState - c.x_hat);
+
+  const float r = sp - ambient;
+  const float e = r - c.x_hat;
   c.xi += e * TS;
 
-  // Ley de control LQI simplificada
-  const float uRaw = -c.kx * x + c.ki * c.xi;
-  float uSat = clampf(uRaw, U_MIN, U_MAX);
+  const float uRaw = -c.kx * c.x_hat + c.ki * c.xi;
+  const float uSat = clampf(uRaw, U_MIN, U_MAX);
 
-  // Anti-windup simple: rollback parcial si saturó
-  if (uRaw != uSat) {
-    c.xi -= 0.5f * e * TS;
-  }
+  // anti-windup por back-calculation simple
+  c.xi += 0.05f * (uSat - uRaw);
 
+  c.u_prev = uSat;
   return uSat;
 }
 
@@ -179,7 +173,6 @@ static void setHeaterPct(const float pct) {
 static void taskSensor(void *pvParameters) {
   (void)pvParameters;
   TickType_t xLastWakeTime = xTaskGetTickCount();
-
   const float alpha = 0.20f;
 
   for (;;) {
@@ -210,12 +203,7 @@ static void taskControl(void *pvParameters) {
     mode = gState.mode;
     xSemaphoreGive(gStateMutex);
 
-    float u = 0.0f;
-    if (mode == CONTROL_PID) {
-      u = runPID(gPID, sp, y);
-    } else {
-      u = runModern(gModern, sp, y, ambient);
-    }
+    float u = (mode == CONTROL_PID) ? runPID(gPID, sp, y) : runModern(gModern, sp, y, ambient);
 
     setHeaterPct(u);
 
@@ -227,33 +215,52 @@ static void taskControl(void *pvParameters) {
   }
 }
 
-static void parseSerialCommand(const String &cmdRaw) {
-  String cmd = cmdRaw;
-  cmd.trim();
-  cmd.toUpperCase();
+static void resetControllers() {
+  gPID.integ = 0.0f;
+  gPID.d_prev = 0.0f;
+  gPID.e_prev = 0.0f;
 
-  if (cmd == "MODE PID") {
-    xSemaphoreTake(gStateMutex, portMAX_DELAY);
-    gState.mode = CONTROL_PID;
-    gPID.integ = 0.0f;
-    gPID.d_prev = 0.0f;
-    gPID.e_prev = 0.0f;
-    xSemaphoreGive(gStateMutex);
-    Serial.println(F("OK MODE PID"));
+  gModern.xi = 0.0f;
+  gModern.x_hat = 0.0f;
+  gModern.u_prev = 0.0f;
+}
+
+static void parseSerialCommand(char *line) {
+  // tokenización en sitio
+  char *token = strtok(line, " \t");
+  if (token == NULL) {
     return;
   }
 
-  if (cmd == "MODE MODERN") {
-    xSemaphoreTake(gStateMutex, portMAX_DELAY);
-    gState.mode = CONTROL_MODERN;
-    gModern.xi = 0.0f;
-    xSemaphoreGive(gStateMutex);
-    Serial.println(F("OK MODE MODERN"));
+  if (strcmp(token, "MODE") == 0) {
+    char *arg = strtok(NULL, " \t");
+    if (arg != NULL && strcmp(arg, "PID") == 0) {
+      xSemaphoreTake(gStateMutex, portMAX_DELAY);
+      gState.mode = CONTROL_PID;
+      resetControllers();
+      xSemaphoreGive(gStateMutex);
+      Serial.println(F("OK MODE PID"));
+      return;
+    }
+    if (arg != NULL && strcmp(arg, "MODERN") == 0) {
+      xSemaphoreTake(gStateMutex, portMAX_DELAY);
+      gState.mode = CONTROL_MODERN;
+      resetControllers();
+      xSemaphoreGive(gStateMutex);
+      Serial.println(F("OK MODE MODERN"));
+      return;
+    }
+    Serial.println(F("ERR MODE"));
     return;
   }
 
-  if (cmd.startsWith("SP ")) {
-    const float newSp = cmd.substring(3).toFloat();
+  if (strcmp(token, "SP") == 0) {
+    char *arg = strtok(NULL, " \t");
+    if (arg == NULL) {
+      Serial.println(F("ERR SP"));
+      return;
+    }
+    const float newSp = atof(arg);
     const float safeSp = clampf(newSp, 20.0f, 85.0f);
 
     xSemaphoreTake(gStateMutex, portMAX_DELAY);
@@ -265,6 +272,48 @@ static void parseSerialCommand(const String &cmdRaw) {
     return;
   }
 
+  if (strcmp(token, "PID") == 0) {
+    char *a = strtok(NULL, " \t");
+    char *b = strtok(NULL, " \t");
+    char *c = strtok(NULL, " \t");
+    if (a == NULL || b == NULL || c == NULL) {
+      Serial.println(F("ERR PID"));
+      return;
+    }
+
+    gPID.kp = atof(a);
+    gPID.ki = atof(b);
+    gPID.kd = atof(c);
+    resetControllers();
+
+    Serial.print(F("OK PID "));
+    Serial.print(gPID.kp, 3);
+    Serial.print(F(" "));
+    Serial.print(gPID.ki, 3);
+    Serial.print(F(" "));
+    Serial.println(gPID.kd, 3);
+    return;
+  }
+
+  if (strcmp(token, "MODERN") == 0) {
+    char *a = strtok(NULL, " \t");
+    char *b = strtok(NULL, " \t");
+    if (a == NULL || b == NULL) {
+      Serial.println(F("ERR MODERN"));
+      return;
+    }
+
+    gModern.kx = atof(a);
+    gModern.ki = atof(b);
+    resetControllers();
+
+    Serial.print(F("OK MODERN "));
+    Serial.print(gModern.kx, 3);
+    Serial.print(F(" "));
+    Serial.println(gModern.ki, 3);
+    return;
+  }
+
   Serial.println(F("ERR CMD"));
 }
 
@@ -272,18 +321,32 @@ static void taskSerial(void *pvParameters) {
   (void)pvParameters;
   TickType_t xLastWakeTime = xTaskGetTickCount();
 
-  String line;
+  static char line[64];
+  static uint8_t idx = 0;
 
   for (;;) {
     while (Serial.available() > 0) {
-      const char c = (char)Serial.read();
-      if (c == '\n' || c == '\r') {
-        if (line.length() > 0) {
+      const char ch = (char)Serial.read();
+
+      if (ch == '\r' || ch == '\n') {
+        if (idx > 0) {
+          line[idx] = '\0';
+
+          // pasa a mayúsculas ASCII simple
+          for (uint8_t i = 0; i < idx; ++i) {
+            if (line[i] >= 'a' && line[i] <= 'z') {
+              line[i] = (char)(line[i] - ('a' - 'A'));
+            }
+          }
+
           parseSerialCommand(line);
-          line = "";
+          idx = 0;
         }
+      } else if (idx < (sizeof(line) - 1)) {
+        line[idx++] = ch;
       } else {
-        line += c;
+        idx = 0;
+        Serial.println(F("ERR LONG"));
       }
     }
 
@@ -313,7 +376,6 @@ static void taskSerial(void *pvParameters) {
 void setup() {
   pinMode(PIN_HEATER_PWM, OUTPUT);
   analogWrite(PIN_HEATER_PWM, 0);
-
   pinMode(PIN_TEMP_ADC, INPUT);
 
   Serial.begin(115200);
@@ -323,14 +385,12 @@ void setup() {
 
   gStateMutex = xSemaphoreCreateMutex();
   if (gStateMutex == NULL) {
-    // Si falla el mutex, dejamos heater apagado
     while (true) {
       analogWrite(PIN_HEATER_PWM, 0);
       delay(100);
     }
   }
 
-  // Estima ambiente en el arranque
   const int adc = analogRead(PIN_TEMP_ADC);
   const float t0 = adcToTempC(adc);
   xSemaphoreTake(gStateMutex, portMAX_DELAY);

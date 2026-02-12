@@ -10,10 +10,11 @@ https://apmonitor.com/pdc/index.php/Main/ArduinoTemperatureControl
    - Anti-windup por integración condicional.
    - Derivada filtrada.
 
-2. **Control moderno (LQI simplificado)**
+2. **Control moderno (LQI-like con observador)**
    - Modelo térmico discreto de primer orden.
-   - Realimentación de estado (temperatura respecto al ambiente).
-   - Integrador del error para eliminar offset en régimen.
+   - Observador para estimar estado térmico interno.
+   - Realimentación de estado + integrador de error.
+   - Anti-windup por back-calculation.
 
 ## Archivo principal
 
@@ -22,7 +23,7 @@ https://apmonitor.com/pdc/index.php/Main/ArduinoTemperatureControl
 ## Requisitos
 
 - Placa: **Arduino Leonardo**
-- Librería: **Arduino_FreeRTOS**
+- Librería: **Arduino_FreeRTOS** (feilipu)
 - Sensor NTC en divisor resistivo (A0)
 - Etapa de potencia para calefactor por PWM (D3)
 
@@ -31,13 +32,33 @@ https://apmonitor.com/pdc/index.php/Main/ArduinoTemperatureControl
 A 115200 baudios:
 
 - `MODE PID` → cambia a controlador PID.
-- `MODE MODERN` → cambia a controlador moderno LQI.
+- `MODE MODERN` → cambia a controlador moderno.
 - `SP <valor>` → ajusta setpoint en °C (20 a 85).
+- `PID <kp> <ki> <kd>` → cambia ganancias PID.
+- `MODERN <kx> <ki>` → cambia ganancias del controlador moderno.
+
+## Prueba de compilación con arduino-cli
+
+### En Windows (ruta que indicaste)
+
+Si tu `arduino-cli.exe` está en:
+
+`C:\arduino-cli_1.4.1_Windows_64bit`
+
+Ejemplo en PowerShell:
+
+```powershell
+cd <ruta_del_repo>
+& "C:\arduino-cli_1.4.1_Windows_64bit\arduino-cli.exe" core update-index
+& "C:\arduino-cli_1.4.1_Windows_64bit\arduino-cli.exe" core install arduino:avr
+& "C:\arduino-cli_1.4.1_Windows_64bit\arduino-cli.exe" lib install "Arduino_FreeRTOS"
+& "C:\arduino-cli_1.4.1_Windows_64bit\arduino-cli.exe" compile --fqbn arduino:avr:leonardo .
+```
 
 ## Notas de ajuste
 
 - Ajusta `R_FIXED`, `R0`, `BETA` si tu NTC es diferente.
-- Ajusta ganancias:
-  - PID: `kp`, `ki`, `kd`.
-  - Moderno: `a`, `b`, `kx`, `ki`.
-- Si el calentamiento es lento o inestable, reduce ganancias antes de aumentar potencia.
+- Ganancias iniciales sugeridas:
+  - PID: `kp=5.0`, `ki=0.18`, `kd=10.0`
+  - Moderno: `kx=1.10`, `ki=0.30`
+- Si aparece oscilación, baja primero `ki` y luego `kp`/`kx`.
