@@ -1,64 +1,70 @@
-# Control de temperatura en Arduino Leonardo con FreeRTOS
+# Firmware base (ESP32 + FreeRTOS) orientado a requerimientos
 
-Implementación basada en el hardware del laboratorio de control de temperatura de APMonitor:
-https://apmonitor.com/pdc/index.php/Main/ArduinoTemperatureControl
+Este proyecto quedó ajustado al **propósito original para ESP32**.
 
-## Incluye dos estrategias de control
+## Qué implementa esta iteración
 
-1. **PID clásico**
-   - Proporcional + integral + derivativo.
-   - Anti-windup por integración condicional.
-   - Derivada filtrada.
+- Arquitectura por capas:
+  - **HAL**: única capa que toca hardware.
+  - **Servicios base**: sensor + scheduler temporal autónomo.
+  - **FSM central**: autoridad única de transición de modos.
+  - **Composición de salidas**: SBP + overrides autorizados.
+- **Servicio Biológico Permanente (SBP)**:
+  - Burbujeo mínimo siempre activo.
+  - Ciclo autónomo 8h luz / 16h oscuridad.
+- Modos de operación en FSM:
+  - `INIT`
+  - `UNCONFIGURED`
+  - `STANDBY`
+  - `USER_LIGHT_ON`
+  - `MEDITATION_1`
+  - `MEDITATION_2`
+  - `ACTIVE_PAUSE`
+  - `ERROR`
 
-2. **Control moderno (LQI-like con observador)**
-   - Modelo térmico discreto de primer orden.
-   - Observador para estimar estado térmico interno.
-   - Realimentación de estado + integrador de error.
-   - Anti-windup por back-calculation.
-
-## Archivo principal
-
+Archivo principal:
 - `leonardo_temp_control_freertos.ino`
 
-## Requisitos
+> El nombre del archivo se conserva por continuidad del repositorio, pero el contenido está orientado a ESP32.
 
-- Placa: **Arduino Leonardo**
-- Librería: **Arduino_FreeRTOS** (feilipu)
-- Sensor NTC en divisor resistivo (A0)
-- Etapa de potencia para calefactor por PWM (D3)
+## Mapeo de hardware actual (ESP32)
 
-## Comandos seriales
+- Luz blanca PWM: GPIO `18` (LEDC canal 0)
+- Burbujeo PWM: GPIO `19` (LEDC canal 1)
+- NTC (ADC): GPIO `34` (ADC1)
+- Botón físico: GPIO `27` (INPUT_PULLUP)
 
-A 115200 baudios:
+## Comandos seriales (115200)
 
-- `MODE PID` → cambia a controlador PID.
-- `MODE MODERN` → cambia a controlador moderno.
-- `SP <valor>` → ajusta setpoint en °C (20 a 85).
-- `PID <kp> <ki> <kd>` → cambia ganancias PID.
-- `MODERN <kx> <ki>` → cambia ganancias del controlador moderno.
+- `MODE STANDBY`
+- `MODE M1`
+- `MODE M2`
+- `PAUSE`
+- `LIGHTOFF`
+- `DAYPWM <5..100>`
 
-## Prueba de compilación con arduino-cli
+Telemetría cada segundo:
+- Estado
+- Temperatura instantánea y filtrada
+- Día/Noche
+- PWM de luz y burbujeo
 
-### En Windows (ruta que indicaste)
+## Requisitos de compilación
 
-Si tu `arduino-cli.exe` está en:
+- Core Arduino para ESP32 instalado.
+- Board example: `esp32:esp32:esp32`
 
-`C:\arduino-cli_1.4.1_Windows_64bit`
+Compilación (referencia):
 
-Ejemplo en PowerShell:
-
-```powershell
-cd <ruta_del_repo>
-& "C:\arduino-cli_1.4.1_Windows_64bit\arduino-cli.exe" core update-index
-& "C:\arduino-cli_1.4.1_Windows_64bit\arduino-cli.exe" core install arduino:avr
-& "C:\arduino-cli_1.4.1_Windows_64bit\arduino-cli.exe" lib install "Arduino_FreeRTOS"
-& "C:\arduino-cli_1.4.1_Windows_64bit\arduino-cli.exe" compile --fqbn arduino:avr:leonardo .
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32 .
 ```
 
-## Notas de ajuste
+## Pendiente en siguientes iteraciones
 
-- Ajusta `R_FIXED`, `R0`, `BETA` si tu NTC es diferente.
-- Ganancias iniciales sugeridas:
-  - PID: `kp=5.0`, `ki=0.18`, `kd=10.0`
-  - Moderno: `kx=1.10`, `ki=0.30`
-- Si aparece oscilación, baja primero `ki` y luego `kp`/`kx`.
+- WiFi AP/STA + mDNS + webserver asíncrono.
+- Persistencia NVS (sin escrituras periódicas de tiempo).
+- Sincronización NTP cada 15 min + fallback relativo.
+- Mantenimiento semanal/trimestral y reset físico.
+- Seguridad/autenticación de escritura en web.
+- OTA con validación y rollback.
