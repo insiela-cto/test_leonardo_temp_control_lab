@@ -1,316 +1,523 @@
 /*
-  Control de temperatura para Arduino Leonardo + FreeRTOS
-  HW base: https://apmonitor.com/pdc/index.php/Main/ArduinoTemperatureControl
+  Firmware base orientado a requerimientos para ESP32 + FreeRTOS (iteración 1)
+  ---------------------------------------------------------------------------
+  Objetivo: alinear la base de firmware con el propósito del proyecto:
+  - ESP32 dual core
+  - FreeRTOS
+  - FSM central reactiva por eventos explícitos
+  - Servicio Biológico Permanente (SBP) desacoplado de interacción
+  - HAL como única capa que toca hardware
 
-  Implementa dos controladores:
-  1) PID clásico (con anti-windup y derivada filtrada)
-  2) Control moderno basado en observador + realimentación de estado + integrador (LQI-like)
+  Alcance de esta iteración:
+  - Ciclo autónomo 8h luz / 16h oscuridad
+  - Burbujeo mínimo permanente
+  - Modos experienciales por FSM
+  - Interacción por botón + serial
 
-  Librerías necesarias:
-  - Arduino_FreeRTOS (https://github.com/feilipu/Arduino_FreeRTOS_Library)
-
-  Comandos por Serial (115200 baudios):
-  - MODE PID
-  - MODE MODERN
-  - SP <valor_en_C>
-  - PID <kp> <ki> <kd>
-  - MODERN <kx> <ki>
+  Pendiente (siguientes iteraciones):
+  - WiFi AP/STA + webserver async
+  - NVS persistencia
+  - NTP y zona horaria
+  - mantenimiento/recordatorios completos
 */
 
 #include <Arduino.h>
-#include <Arduino_FreeRTOS.h>
-#include <semphr.h>
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
 
-// -------------------- Configuración de hardware --------------------
-static const uint8_t PIN_HEATER_PWM = 3;   // PWM al transistor/MOSFET del calefactor
-static const uint8_t PIN_TEMP_ADC   = A0;  // NTC en divisor
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
 
-// -------------------- Configuración de muestreo --------------------
-static const float TS = 0.2f;  // [s] período de control
-static const TickType_t TASK_PERIOD_TICKS = pdMS_TO_TICKS((uint16_t)(TS * 1000.0f));
+// -----------------------------------------------------------------------------
+// 1) HAL (única capa que opera hardware)
+// -----------------------------------------------------------------------------
+namespace Hal {
+static constexpr int PIN_LIGHT_PWM = 18;   // Luz blanca principal
+static constexpr int PIN_BUBBLE_PWM = 19;  // Motobomba aire (driver PWM)
+static constexpr int PIN_TEMP_ADC = 34;    // ADC1 (entrada analógica)
+static constexpr int PIN_BUTTON = 27;      // Botón físico
 
-// -------------------- Parámetros del sensor (NTC Beta) --------------------
-static const float R_FIXED = 10000.0f; // resistor fijo del divisor [ohm]
-static const float R0 = 10000.0f;      // resistencia NTC a T0 [ohm]
-static const float T0_K = 298.15f;     // 25°C en Kelvin
-static const float BETA = 3950.0f;     // constante beta típica
+static constexpr int LEDC_FREQ_HZ = 5000;
+static constexpr int LEDC_RES_BITS = 8;
+static constexpr int CH_LIGHT = 0;
+static constexpr int CH_BUBBLE = 1;
 
-// -------------------- Límites y setpoint --------------------
-static const float U_MIN = 0.0f;    // 0% potencia
-static const float U_MAX = 100.0f;  // 100% potencia
-static const float DEFAULT_SP = 45.0f;
-
-enum ControlMode : uint8_t {
-  CONTROL_PID = 0,
-  CONTROL_MODERN = 1,
-};
-
-struct SharedState {
-  float tempC;
-  float tempFiltC;
-  float setpointC;
-  float controlPct;
-  float ambientC;
-  ControlMode mode;
-};
-
-static SharedState gState = {25.0f, 25.0f, DEFAULT_SP, 0.0f, 25.0f, CONTROL_PID};
-static SemaphoreHandle_t gStateMutex;
-
-// -------------------- PID --------------------
-struct PIDController {
-  float kp;
-  float ki;
-  float kd;
-  float tau_d;
-  float integ;
-  float d_prev;
-  float e_prev;
-};
-
-static PIDController gPID = {
-  .kp = 5.0f,
-  .ki = 0.18f,
-  .kd = 10.0f,
-  .tau_d = 0.25f,
-  .integ = 0.0f,
-  .d_prev = 0.0f,
-  .e_prev = 0.0f,
-};
-
-// -------------------- Control moderno (LQI-like) --------------------
-// Modelo térmico: x[k+1] = a*x[k] + b*u[k], y[k] = x[k] + ambiente
-// x_hat se estima con un observador discreto simple.
-struct ModernController {
-  float a;   // dinámica discreta del proceso térmico
-  float b;   // ganancia discreta por % de potencia
-  float l;   // ganancia del observador
-  float kx;  // realimentación de estado
-  float ki;  // ganancia del integrador de error
-  float x_hat;
-  float xi;
-  float u_prev;
-};
-
-static ModernController gModern = {
-  .a = 0.985f,
-  .b = 0.09f,
-  .l = 0.25f,
-  .kx = 1.10f,
-  .ki = 0.30f,
-  .x_hat = 0.0f,
-  .xi = 0.0f,
-  .u_prev = 0.0f,
-};
+// Compatibilidad LEDC:
+// - Core ESP32 2.x: ledcSetup + ledcAttachPin + ledcWrite(canal,duty)
+// - Core ESP32 3.x: ledcAttach(pin,freq,res) + ledcWrite(pin,duty)
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+static constexpr bool USE_LEDC_V3_API = true;
+#else
+static constexpr bool USE_LEDC_V3_API = false;
+#endif
 
 static float clampf(const float v, const float lo, const float hi) {
   return (v < lo) ? lo : ((v > hi) ? hi : v);
 }
 
-static float adcToTempC(const int adc) {
-  const float adcSafe = (adc <= 0) ? 1.0f : ((adc >= 1023) ? 1022.0f : (float)adc);
-  const float rNtc = R_FIXED * (adcSafe / (1023.0f - adcSafe));
+void init() {
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+
+  if (USE_LEDC_V3_API) {
+    ledcAttach(PIN_LIGHT_PWM, LEDC_FREQ_HZ, LEDC_RES_BITS);
+    ledcAttach(PIN_BUBBLE_PWM, LEDC_FREQ_HZ, LEDC_RES_BITS);
+    ledcWrite(PIN_LIGHT_PWM, 0);
+    ledcWrite(PIN_BUBBLE_PWM, 0);
+  } else {
+    ledcSetup(CH_LIGHT, LEDC_FREQ_HZ, LEDC_RES_BITS);
+    ledcAttachPin(PIN_LIGHT_PWM, CH_LIGHT);
+
+    ledcSetup(CH_BUBBLE, LEDC_FREQ_HZ, LEDC_RES_BITS);
+    ledcAttachPin(PIN_BUBBLE_PWM, CH_BUBBLE);
+
+    ledcWrite(CH_LIGHT, 0);
+    ledcWrite(CH_BUBBLE, 0);
+  }
+}
+
+void writeLightPct(const float pct) {
+  const float p = clampf(pct, 0.0f, 100.0f);
+  const uint8_t duty = static_cast<uint8_t>(roundf((p / 100.0f) * 255.0f));
+  if (USE_LEDC_V3_API) {
+    ledcWrite(PIN_LIGHT_PWM, duty);
+  } else {
+    ledcWrite(CH_LIGHT, duty);
+  }
+}
+
+void writeBubblePct(const float pct) {
+  const float p = clampf(pct, 0.0f, 100.0f);
+  const uint8_t duty = static_cast<uint8_t>(roundf((p / 100.0f) * 255.0f));
+  if (USE_LEDC_V3_API) {
+    ledcWrite(PIN_BUBBLE_PWM, duty);
+  } else {
+    ledcWrite(CH_BUBBLE, duty);
+  }
+}
+
+bool readButtonPressed() {
+  return digitalRead(PIN_BUTTON) == LOW;
+}
+
+// NTC Beta (ajustable)
+static constexpr float R_FIXED = 10000.0f;
+static constexpr float R0 = 10000.0f;
+static constexpr float T0_K = 298.15f;
+static constexpr float BETA = 3950.0f;
+
+float readTempC() {
+  // ESP32 ADC1 default width 12 bits (0..4095)
+  const int adcRaw = analogRead(PIN_TEMP_ADC);
+  const float adc = (adcRaw <= 0) ? 1.0f : ((adcRaw >= 4095) ? 4094.0f : static_cast<float>(adcRaw));
+
+  // Divisor: Vout = Vcc * Rntc / (R_FIXED + Rntc)
+  const float rNtc = R_FIXED * (adc / (4095.0f - adc));
   const float invT = (1.0f / T0_K) + (1.0f / BETA) * logf(rNtc / R0);
   const float tempK = 1.0f / invT;
   return tempK - 273.15f;
 }
+}  // namespace Hal
 
-static float runPID(PIDController &c, const float sp, const float y) {
-  const float e = sp - y;
-  const float integCandidate = c.integ + c.ki * TS * e;
+// -----------------------------------------------------------------------------
+// 2) Modelo FSM + eventos explícitos
+// -----------------------------------------------------------------------------
+enum SystemState : uint8_t {
+  STATE_INIT = 0,
+  STATE_UNCONFIGURED,
+  STATE_STANDBY,
+  STATE_USER_LIGHT_ON,
+  STATE_MEDITATION_1,
+  STATE_MEDITATION_2,
+  STATE_ACTIVE_PAUSE,
+  STATE_ERROR,
+};
 
-  const float de = (e - c.e_prev) / TS;
-  const float alpha = c.tau_d / (c.tau_d + TS);
-  const float d = alpha * c.d_prev + (1.0f - alpha) * de;
+enum EventType : uint8_t {
+  EV_BOOT = 0,
+  EV_WIFI_MISSING,
+  EV_BUTTON_SHORT,
+  EV_BUTTON_LONG,
+  EV_MEDITATION_1_REQ,
+  EV_MEDITATION_2_REQ,
+  EV_ACTIVE_PAUSE_REQ,
+  EV_ACTIVE_PAUSE_TIMEOUT,
+  EV_LIGHT_FORCE_OFF,
+  EV_ERROR_RECOVERABLE,
+  EV_ERROR_CRITICAL,
+};
 
-  float uUnsat = c.kp * e + integCandidate + c.kd * d;
-  float uSat = clampf(uUnsat, U_MIN, U_MAX);
+struct Event {
+  EventType type;
+  uint32_t data;
+};
 
-  const bool satHigh = (uUnsat > U_MAX);
-  const bool satLow = (uUnsat < U_MIN);
-  const bool integrate = (!satHigh && !satLow) || (satHigh && e < 0.0f) || (satLow && e > 0.0f);
+struct Config {
+  float dayLightPct;
+  float minBubblePct;
+  uint16_t dayMinutes;    // 8h en modo autónomo
+  uint16_t nightMinutes;  // 16h en modo autónomo
+  bool activePauseEnabled;
+  uint16_t activePauseEveryMinutes;
+  uint16_t activePauseDurationSec;
+};
 
-  if (integrate) {
-    c.integ = integCandidate;
-    uUnsat = c.kp * e + c.integ + c.kd * d;
-    uSat = clampf(uUnsat, U_MIN, U_MAX);
+struct Runtime {
+  SystemState state;
+  float tempC;
+  float tempFiltC;
+  bool isDay;
+  bool lightForcedOff;
+
+  uint32_t cycleElapsedSec;
+  uint32_t pausePeriodElapsedSec;
+  uint32_t pauseElapsedSec;
+
+  float sbpLightPct;
+  float sbpBubblePct;
+  float outLightPct;
+  float outBubblePct;
+};
+
+static Config gCfg = {
+    85.0f,
+    20.0f,
+    static_cast<uint16_t>(8u * 60u),
+    static_cast<uint16_t>(16u * 60u),
+    true,
+    60u,
+    120u,
+};
+
+static Runtime gRt = {
+    STATE_INIT,
+    25.0f,
+    25.0f,
+    true,
+    false,
+    0u,
+    0u,
+    0u,
+    0.0f,
+    0.0f,
+    0.0f,
+    0.0f,
+};
+
+static SemaphoreHandle_t gMutex = nullptr;
+static QueueHandle_t gEventQueue = nullptr;
+
+static bool postEvent(const EventType type, const uint32_t data = 0u) {
+  const Event e{type, data};
+  return xQueueSend(gEventQueue, &e, 0) == pdTRUE;
+}
+
+// -----------------------------------------------------------------------------
+// 3) SBP y composición de salidas
+// -----------------------------------------------------------------------------
+static void sbpComputeBase() {
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+
+  // Servicio biológico mínimo permanente
+  gRt.sbpBubblePct = gCfg.minBubblePct;
+  gRt.sbpLightPct = (gRt.isDay && !gRt.lightForcedOff) ? gCfg.dayLightPct : 0.0f;
+
+  xSemaphoreGive(gMutex);
+}
+
+static void composeAndApplyOutputs() {
+  float light;
+  float bubble;
+  SystemState st;
+
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  light = gRt.sbpLightPct;
+  bubble = gRt.sbpBubblePct;
+  st = gRt.state;
+
+  if (st == STATE_STANDBY) {
+    light = 0.0f;
+  } else if (st == STATE_MEDITATION_1) {
+    light = 35.0f;
+  } else if (st == STATE_MEDITATION_2) {
+    light = 15.0f;
+  } else if (st == STATE_ACTIVE_PAUSE) {
+    light = 100.0f;
+    bubble = 40.0f;
   }
 
-  c.e_prev = e;
-  c.d_prev = d;
-  return uSat;
+  gRt.outLightPct = light;
+  gRt.outBubblePct = bubble;
+  xSemaphoreGive(gMutex);
+
+  Hal::writeLightPct(light);
+  Hal::writeBubblePct(bubble);
 }
 
-static float runModern(ModernController &c, const float sp, const float y, const float ambient) {
-  const float yState = y - ambient;
-
-  // Observador de estado (usa modelo + corrección por error de medición)
-  c.x_hat = c.a * c.x_hat + c.b * c.u_prev + c.l * (yState - c.x_hat);
-
-  const float r = sp - ambient;
-  const float e = r - c.x_hat;
-  c.xi += e * TS;
-
-  const float uRaw = -c.kx * c.x_hat + c.ki * c.xi;
-  const float uSat = clampf(uRaw, U_MIN, U_MAX);
-
-  // anti-windup por back-calculation simple
-  c.xi += 0.05f * (uSat - uRaw);
-
-  c.u_prev = uSat;
-  return uSat;
+// -----------------------------------------------------------------------------
+// 4) FSM central
+// -----------------------------------------------------------------------------
+static void setState(const SystemState s) {
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  gRt.state = s;
+  if (s != STATE_ACTIVE_PAUSE) {
+    gRt.pauseElapsedSec = 0u;
+  }
+  xSemaphoreGive(gMutex);
 }
 
-static void setHeaterPct(const float pct) {
-  const float p = clampf(pct, U_MIN, U_MAX);
-  const uint8_t pwm = (uint8_t)roundf((p / 100.0f) * 255.0f);
-  analogWrite(PIN_HEATER_PWM, pwm);
+static void processEvent(const Event &e) {
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  const SystemState current = gRt.state;
+  xSemaphoreGive(gMutex);
+
+  switch (current) {
+    case STATE_INIT:
+      if (e.type == EV_BOOT) {
+        setState(STATE_UNCONFIGURED);
+      }
+      break;
+
+    case STATE_UNCONFIGURED:
+      if (e.type == EV_WIFI_MISSING) {
+        setState(STATE_STANDBY);
+      }
+      break;
+
+    case STATE_STANDBY:
+      if (e.type == EV_BUTTON_SHORT) {
+        setState(STATE_USER_LIGHT_ON);
+      } else if (e.type == EV_MEDITATION_1_REQ) {
+        setState(STATE_MEDITATION_1);
+      } else if (e.type == EV_MEDITATION_2_REQ) {
+        setState(STATE_MEDITATION_2);
+      }
+      break;
+
+    case STATE_USER_LIGHT_ON:
+      if (e.type == EV_BUTTON_SHORT) {
+        setState(STATE_MEDITATION_1);
+      } else if (e.type == EV_ACTIVE_PAUSE_REQ) {
+        setState(STATE_ACTIVE_PAUSE);
+      } else if (e.type == EV_LIGHT_FORCE_OFF) {
+        xSemaphoreTake(gMutex, portMAX_DELAY);
+        gRt.lightForcedOff = true;
+        xSemaphoreGive(gMutex);
+      }
+      break;
+
+    case STATE_MEDITATION_1:
+      if (e.type == EV_BUTTON_SHORT) {
+        setState(STATE_MEDITATION_2);
+      } else if (e.type == EV_BUTTON_LONG) {
+        setState(STATE_USER_LIGHT_ON);
+      }
+      break;
+
+    case STATE_MEDITATION_2:
+      if (e.type == EV_BUTTON_SHORT || e.type == EV_BUTTON_LONG) {
+        setState(STATE_USER_LIGHT_ON);
+      }
+      break;
+
+    case STATE_ACTIVE_PAUSE:
+      if (e.type == EV_ACTIVE_PAUSE_TIMEOUT || e.type == EV_BUTTON_LONG) {
+        setState(STATE_USER_LIGHT_ON);
+      }
+      break;
+
+    case STATE_ERROR:
+      if (e.type == EV_ERROR_RECOVERABLE) {
+        setState(STATE_STANDBY);
+      }
+      break;
+
+    default:
+      setState(STATE_ERROR);
+      break;
+  }
+
+  if (e.type == EV_ERROR_CRITICAL) {
+    setState(STATE_ERROR);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// 5) Tareas FreeRTOS
+// -----------------------------------------------------------------------------
+static void taskFsm(void *pvParameters) {
+  (void)pvParameters;
+  Event e{};
+
+  for (;;) {
+    if (xQueueReceive(gEventQueue, &e, portMAX_DELAY) == pdTRUE) {
+      processEvent(e);
+      sbpComputeBase();
+      composeAndApplyOutputs();
+    }
+  }
 }
 
 static void taskSensor(void *pvParameters) {
   (void)pvParameters;
-  TickType_t xLastWakeTime = xTaskGetTickCount();
-  const float alpha = 0.20f;
+  TickType_t lastWake = xTaskGetTickCount();
+  constexpr float alpha = 0.2f;
 
   for (;;) {
-    const int adc = analogRead(PIN_TEMP_ADC);
-    const float t = adcToTempC(adc);
+    const float t = Hal::readTempC();
 
-    xSemaphoreTake(gStateMutex, portMAX_DELAY);
-    gState.tempC = t;
-    gState.tempFiltC = alpha * t + (1.0f - alpha) * gState.tempFiltC;
-    xSemaphoreGive(gStateMutex);
+    xSemaphoreTake(gMutex, portMAX_DELAY);
+    gRt.tempC = t;
+    gRt.tempFiltC = alpha * t + (1.0f - alpha) * gRt.tempFiltC;
+    xSemaphoreGive(gMutex);
 
-    vTaskDelayUntil(&xLastWakeTime, TASK_PERIOD_TICKS);
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(200));
   }
 }
 
-static void taskControl(void *pvParameters) {
+static void taskScheduler(void *pvParameters) {
   (void)pvParameters;
-  TickType_t xLastWakeTime = xTaskGetTickCount();
+  TickType_t lastWake = xTaskGetTickCount();
 
   for (;;) {
-    float sp, y, ambient;
-    ControlMode mode;
+    xSemaphoreTake(gMutex, portMAX_DELAY);
 
-    xSemaphoreTake(gStateMutex, portMAX_DELAY);
-    sp = gState.setpointC;
-    y = gState.tempFiltC;
-    ambient = gState.ambientC;
-    mode = gState.mode;
-    xSemaphoreGive(gStateMutex);
+    gRt.cycleElapsedSec += 1u;
+    gRt.pausePeriodElapsedSec += 1u;
 
-    float u = (mode == CONTROL_PID) ? runPID(gPID, sp, y) : runModern(gModern, sp, y, ambient);
+    const uint32_t daySec = static_cast<uint32_t>(gCfg.dayMinutes) * 60u;
+    const uint32_t cycleSec = static_cast<uint32_t>(gCfg.dayMinutes + gCfg.nightMinutes) * 60u;
 
-    setHeaterPct(u);
+    if (gRt.cycleElapsedSec >= cycleSec) {
+      gRt.cycleElapsedSec = 0u;
+    }
+    gRt.isDay = (gRt.cycleElapsedSec < daySec);
 
-    xSemaphoreTake(gStateMutex, portMAX_DELAY);
-    gState.controlPct = u;
-    xSemaphoreGive(gStateMutex);
+    if (gCfg.activePauseEnabled &&
+        gRt.pausePeriodElapsedSec >= static_cast<uint32_t>(gCfg.activePauseEveryMinutes) * 60u) {
+      gRt.pausePeriodElapsedSec = 0u;
+      postEvent(EV_ACTIVE_PAUSE_REQ);
+    }
 
-    vTaskDelayUntil(&xLastWakeTime, TASK_PERIOD_TICKS);
+    if (gRt.state == STATE_ACTIVE_PAUSE) {
+      gRt.pauseElapsedSec += 1u;
+      if (gRt.pauseElapsedSec >= gCfg.activePauseDurationSec) {
+        postEvent(EV_ACTIVE_PAUSE_TIMEOUT);
+      }
+    }
+
+    xSemaphoreGive(gMutex);
+
+    sbpComputeBase();
+    composeAndApplyOutputs();
+
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(1000));
   }
 }
 
-static void resetControllers() {
-  gPID.integ = 0.0f;
-  gPID.d_prev = 0.0f;
-  gPID.e_prev = 0.0f;
+static void taskButton(void *pvParameters) {
+  (void)pvParameters;
+  TickType_t lastWake = xTaskGetTickCount();
 
-  gModern.xi = 0.0f;
-  gModern.x_hat = 0.0f;
-  gModern.u_prev = 0.0f;
+  bool prevPressed = false;
+  uint16_t ticksPressed = 0u;
+
+  for (;;) {
+    const bool pressed = Hal::readButtonPressed();
+
+    if (pressed && ticksPressed < 5000u) {
+      ticksPressed++;
+    }
+
+    if (prevPressed && !pressed) {
+      if (ticksPressed >= 30u) {
+        postEvent(EV_BUTTON_LONG);   // 3.0 s (100 ms period)
+      } else if (ticksPressed >= 1u) {
+        postEvent(EV_BUTTON_SHORT);  // 100..2900 ms
+      }
+      ticksPressed = 0u;
+    }
+
+    prevPressed = pressed;
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(100));
+  }
 }
 
-static void parseSerialCommand(char *line) {
-  // tokenización en sitio
-  char *token = strtok(line, " \t");
-  if (token == NULL) {
+static void printTelemetry() {
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  const Runtime r = gRt;
+  xSemaphoreGive(gMutex);
+
+  Serial.print(F("STATE="));
+  Serial.print(static_cast<int>(r.state));
+  Serial.print(F(",T="));
+  Serial.print(r.tempC, 2);
+  Serial.print(F(",TF="));
+  Serial.print(r.tempFiltC, 2);
+  Serial.print(F(",DAY="));
+  Serial.print(r.isDay ? F("1") : F("0"));
+  Serial.print(F(",L="));
+  Serial.print(r.outLightPct, 1);
+  Serial.print(F(",B="));
+  Serial.println(r.outBubblePct, 1);
+}
+
+static void parseSerialLine(char *line) {
+  char *tok = strtok(line, " \t");
+  if (tok == nullptr) {
     return;
   }
 
-  if (strcmp(token, "MODE") == 0) {
-    char *arg = strtok(NULL, " \t");
-    if (arg != NULL && strcmp(arg, "PID") == 0) {
-      xSemaphoreTake(gStateMutex, portMAX_DELAY);
-      gState.mode = CONTROL_PID;
-      resetControllers();
-      xSemaphoreGive(gStateMutex);
-      Serial.println(F("OK MODE PID"));
+  if (strcmp(tok, "MODE") == 0) {
+    char *arg = strtok(nullptr, " \t");
+    if (arg != nullptr && strcmp(arg, "STANDBY") == 0) {
+      postEvent(EV_WIFI_MISSING);
+      Serial.println(F("OK MODE STANDBY"));
       return;
     }
-    if (arg != NULL && strcmp(arg, "MODERN") == 0) {
-      xSemaphoreTake(gStateMutex, portMAX_DELAY);
-      gState.mode = CONTROL_MODERN;
-      resetControllers();
-      xSemaphoreGive(gStateMutex);
-      Serial.println(F("OK MODE MODERN"));
+    if (arg != nullptr && strcmp(arg, "M1") == 0) {
+      postEvent(EV_MEDITATION_1_REQ);
+      Serial.println(F("OK MODE M1"));
       return;
     }
+    if (arg != nullptr && strcmp(arg, "M2") == 0) {
+      postEvent(EV_MEDITATION_2_REQ);
+      Serial.println(F("OK MODE M2"));
+      return;
+    }
+
     Serial.println(F("ERR MODE"));
     return;
   }
 
-  if (strcmp(token, "SP") == 0) {
-    char *arg = strtok(NULL, " \t");
-    if (arg == NULL) {
-      Serial.println(F("ERR SP"));
-      return;
-    }
-    const float newSp = atof(arg);
-    const float safeSp = clampf(newSp, 20.0f, 85.0f);
-
-    xSemaphoreTake(gStateMutex, portMAX_DELAY);
-    gState.setpointC = safeSp;
-    xSemaphoreGive(gStateMutex);
-
-    Serial.print(F("OK SP "));
-    Serial.println(safeSp, 2);
+  if (strcmp(tok, "PAUSE") == 0) {
+    postEvent(EV_ACTIVE_PAUSE_REQ);
+    Serial.println(F("OK PAUSE"));
     return;
   }
 
-  if (strcmp(token, "PID") == 0) {
-    char *a = strtok(NULL, " \t");
-    char *b = strtok(NULL, " \t");
-    char *c = strtok(NULL, " \t");
-    if (a == NULL || b == NULL || c == NULL) {
-      Serial.println(F("ERR PID"));
-      return;
-    }
-
-    gPID.kp = atof(a);
-    gPID.ki = atof(b);
-    gPID.kd = atof(c);
-    resetControllers();
-
-    Serial.print(F("OK PID "));
-    Serial.print(gPID.kp, 3);
-    Serial.print(F(" "));
-    Serial.print(gPID.ki, 3);
-    Serial.print(F(" "));
-    Serial.println(gPID.kd, 3);
+  if (strcmp(tok, "LIGHTOFF") == 0) {
+    postEvent(EV_LIGHT_FORCE_OFF);
+    Serial.println(F("OK LIGHTOFF"));
     return;
   }
 
-  if (strcmp(token, "MODERN") == 0) {
-    char *a = strtok(NULL, " \t");
-    char *b = strtok(NULL, " \t");
-    if (a == NULL || b == NULL) {
-      Serial.println(F("ERR MODERN"));
+  if (strcmp(tok, "DAYPWM") == 0) {
+    char *arg = strtok(nullptr, " \t");
+    if (arg == nullptr) {
+      Serial.println(F("ERR DAYPWM"));
       return;
     }
 
-    gModern.kx = atof(a);
-    gModern.ki = atof(b);
-    resetControllers();
+    const float v = atof(arg);
+    xSemaphoreTake(gMutex, portMAX_DELAY);
+    gCfg.dayLightPct = Hal::clampf(v, 5.0f, 100.0f);
+    xSemaphoreGive(gMutex);
 
-    Serial.print(F("OK MODERN "));
-    Serial.print(gModern.kx, 3);
-    Serial.print(F(" "));
-    Serial.println(gModern.ki, 3);
+    Serial.print(F("OK DAYPWM "));
+    Serial.println(gCfg.dayLightPct, 1);
     return;
   }
 
@@ -319,30 +526,28 @@ static void parseSerialCommand(char *line) {
 
 static void taskSerial(void *pvParameters) {
   (void)pvParameters;
-  TickType_t xLastWakeTime = xTaskGetTickCount();
+  TickType_t lastWake = xTaskGetTickCount();
 
   static char line[64];
   static uint8_t idx = 0;
 
   for (;;) {
     while (Serial.available() > 0) {
-      const char ch = (char)Serial.read();
-
+      const char ch = static_cast<char>(Serial.read());
       if (ch == '\r' || ch == '\n') {
         if (idx > 0) {
           line[idx] = '\0';
 
-          // pasa a mayúsculas ASCII simple
           for (uint8_t i = 0; i < idx; ++i) {
             if (line[i] >= 'a' && line[i] <= 'z') {
-              line[i] = (char)(line[i] - ('a' - 'A'));
+              line[i] = static_cast<char>(line[i] - ('a' - 'A'));
             }
           }
 
-          parseSerialCommand(line);
+          parseSerialLine(line);
           idx = 0;
         }
-      } else if (idx < (sizeof(line) - 1)) {
+      } else if (idx < sizeof(line) - 1u) {
         line[idx++] = ch;
       } else {
         idx = 0;
@@ -350,60 +555,54 @@ static void taskSerial(void *pvParameters) {
       }
     }
 
-    xSemaphoreTake(gStateMutex, portMAX_DELAY);
-    const float t = gState.tempC;
-    const float tf = gState.tempFiltC;
-    const float sp = gState.setpointC;
-    const float u = gState.controlPct;
-    const ControlMode m = gState.mode;
-    xSemaphoreGive(gStateMutex);
-
-    Serial.print(F("MODE="));
-    Serial.print((m == CONTROL_PID) ? F("PID") : F("MODERN"));
-    Serial.print(F(", T="));
-    Serial.print(t, 2);
-    Serial.print(F(", TF="));
-    Serial.print(tf, 2);
-    Serial.print(F(", SP="));
-    Serial.print(sp, 2);
-    Serial.print(F(", U="));
-    Serial.println(u, 1);
-
-    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
+    printTelemetry();
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(1000));
   }
 }
 
+// -----------------------------------------------------------------------------
+// setup / loop
+// -----------------------------------------------------------------------------
 void setup() {
-  pinMode(PIN_HEATER_PWM, OUTPUT);
-  analogWrite(PIN_HEATER_PWM, 0);
-  pinMode(PIN_TEMP_ADC, INPUT);
+  Hal::init();
 
   Serial.begin(115200);
-  while (!Serial) {
-    ;
+  Serial.println(F("BOOT: ESP32 firmware init"));
+  const uint32_t t0 = millis();
+  while (!Serial && (millis() - t0) < 3000u) {
+    // espera corta opcional de puerto serial
   }
 
-  gStateMutex = xSemaphoreCreateMutex();
-  if (gStateMutex == NULL) {
-    while (true) {
-      analogWrite(PIN_HEATER_PWM, 0);
-      delay(100);
+  gMutex = xSemaphoreCreateMutex();
+  gEventQueue = xQueueCreate(24, sizeof(Event));
+
+  if (gMutex == nullptr || gEventQueue == nullptr) {
+    // Estado seguro: luz off + burbujeo mínimo
+    Hal::writeLightPct(0.0f);
+    Hal::writeBubblePct(20.0f);
+    for (;;) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
     }
   }
 
-  const int adc = analogRead(PIN_TEMP_ADC);
-  const float t0 = adcToTempC(adc);
-  xSemaphoreTake(gStateMutex, portMAX_DELAY);
-  gState.tempC = t0;
-  gState.tempFiltC = t0;
-  gState.ambientC = t0;
-  xSemaphoreGive(gStateMutex);
+  const float tInit = Hal::readTempC();
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  gRt.tempC = tInit;
+  gRt.tempFiltC = tInit;
+  xSemaphoreGive(gMutex);
 
-  xTaskCreate(taskSensor,  "Sensor",  192, NULL, 3, NULL);
-  xTaskCreate(taskControl, "Control", 256, NULL, 2, NULL);
-  xTaskCreate(taskSerial,  "Serial",  256, NULL, 1, NULL);
+  // Tareas (núcleo no fijado en esta iteración)
+  xTaskCreate(taskFsm, "fsm", 4096, nullptr, 3, nullptr);
+  xTaskCreate(taskSensor, "sensor", 3072, nullptr, 2, nullptr);
+  xTaskCreate(taskScheduler, "scheduler", 3072, nullptr, 2, nullptr);
+  xTaskCreate(taskButton, "button", 2048, nullptr, 2, nullptr);
+  xTaskCreate(taskSerial, "serial", 4096, nullptr, 1, nullptr);
+
+  postEvent(EV_BOOT);
+  postEvent(EV_WIFI_MISSING);  // RF-04: sin Internet -> STANDBY
 }
 
 void loop() {
-  // No se usa con FreeRTOS
+  // No usado. La ejecución ocurre en tareas FreeRTOS.
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
