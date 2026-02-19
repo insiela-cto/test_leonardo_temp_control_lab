@@ -60,6 +60,27 @@ Compilación (referencia):
 arduino-cli compile --fqbn esp32:esp32:esp32 .
 ```
 
+## Si "no arranca" en Linux (checklist rápido)
+
+1. Verifica board y puerto:
+```bash
+arduino-cli board list
+```
+2. Sube con monitor serie en 115200 para ver `BOOT: ESP32 firmware init`.
+3. Si no ves logs, revisa permisos del puerto serie:
+```bash
+groups
+sudo usermod -aG dialout $USER
+```
+4. Reinicia sesión y vuelve a probar carga/monitor.
+
+Comandos útiles:
+
+```bash
+arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32 .
+arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200
+```
+
 ## Pendiente en siguientes iteraciones
 
 - WiFi AP/STA + mDNS + webserver asíncrono.

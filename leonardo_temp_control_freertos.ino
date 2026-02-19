@@ -45,6 +45,15 @@ static constexpr int LEDC_RES_BITS = 8;
 static constexpr int CH_LIGHT = 0;
 static constexpr int CH_BUBBLE = 1;
 
+// Compatibilidad LEDC:
+// - Core ESP32 2.x: ledcSetup + ledcAttachPin + ledcWrite(canal,duty)
+// - Core ESP32 3.x: ledcAttach(pin,freq,res) + ledcWrite(pin,duty)
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+static constexpr bool USE_LEDC_V3_API = true;
+#else
+static constexpr bool USE_LEDC_V3_API = false;
+#endif
+
 static float clampf(const float v, const float lo, const float hi) {
   return (v < lo) ? lo : ((v > hi) ? hi : v);
 }
@@ -52,26 +61,41 @@ static float clampf(const float v, const float lo, const float hi) {
 void init() {
   pinMode(PIN_BUTTON, INPUT_PULLUP);
 
-  ledcSetup(CH_LIGHT, LEDC_FREQ_HZ, LEDC_RES_BITS);
-  ledcAttachPin(PIN_LIGHT_PWM, CH_LIGHT);
+  if (USE_LEDC_V3_API) {
+    ledcAttach(PIN_LIGHT_PWM, LEDC_FREQ_HZ, LEDC_RES_BITS);
+    ledcAttach(PIN_BUBBLE_PWM, LEDC_FREQ_HZ, LEDC_RES_BITS);
+    ledcWrite(PIN_LIGHT_PWM, 0);
+    ledcWrite(PIN_BUBBLE_PWM, 0);
+  } else {
+    ledcSetup(CH_LIGHT, LEDC_FREQ_HZ, LEDC_RES_BITS);
+    ledcAttachPin(PIN_LIGHT_PWM, CH_LIGHT);
 
-  ledcSetup(CH_BUBBLE, LEDC_FREQ_HZ, LEDC_RES_BITS);
-  ledcAttachPin(PIN_BUBBLE_PWM, CH_BUBBLE);
+    ledcSetup(CH_BUBBLE, LEDC_FREQ_HZ, LEDC_RES_BITS);
+    ledcAttachPin(PIN_BUBBLE_PWM, CH_BUBBLE);
 
-  ledcWrite(CH_LIGHT, 0);
-  ledcWrite(CH_BUBBLE, 0);
+    ledcWrite(CH_LIGHT, 0);
+    ledcWrite(CH_BUBBLE, 0);
+  }
 }
 
 void writeLightPct(const float pct) {
   const float p = clampf(pct, 0.0f, 100.0f);
   const uint8_t duty = static_cast<uint8_t>(roundf((p / 100.0f) * 255.0f));
-  ledcWrite(CH_LIGHT, duty);
+  if (USE_LEDC_V3_API) {
+    ledcWrite(PIN_LIGHT_PWM, duty);
+  } else {
+    ledcWrite(CH_LIGHT, duty);
+  }
 }
 
 void writeBubblePct(const float pct) {
   const float p = clampf(pct, 0.0f, 100.0f);
   const uint8_t duty = static_cast<uint8_t>(roundf((p / 100.0f) * 255.0f));
-  ledcWrite(CH_BUBBLE, duty);
+  if (USE_LEDC_V3_API) {
+    ledcWrite(PIN_BUBBLE_PWM, duty);
+  } else {
+    ledcWrite(CH_BUBBLE, duty);
+  }
 }
 
 bool readButtonPressed() {
@@ -158,28 +182,28 @@ struct Runtime {
 };
 
 static Config gCfg = {
-    .dayLightPct = 85.0f,
-    .minBubblePct = 20.0f,
-    .dayMinutes = 8u * 60u,
-    .nightMinutes = 16u * 60u,
-    .activePauseEnabled = true,
-    .activePauseEveryMinutes = 60u,
-    .activePauseDurationSec = 120u,
+    85.0f,
+    20.0f,
+    static_cast<uint16_t>(8u * 60u),
+    static_cast<uint16_t>(16u * 60u),
+    true,
+    60u,
+    120u,
 };
 
 static Runtime gRt = {
-    .state = STATE_INIT,
-    .tempC = 25.0f,
-    .tempFiltC = 25.0f,
-    .isDay = true,
-    .lightForcedOff = false,
-    .cycleElapsedSec = 0u,
-    .pausePeriodElapsedSec = 0u,
-    .pauseElapsedSec = 0u,
-    .sbpLightPct = 0.0f,
-    .sbpBubblePct = 0.0f,
-    .outLightPct = 0.0f,
-    .outBubblePct = 0.0f,
+    STATE_INIT,
+    25.0f,
+    25.0f,
+    true,
+    false,
+    0u,
+    0u,
+    0u,
+    0.0f,
+    0.0f,
+    0.0f,
+    0.0f,
 };
 
 static SemaphoreHandle_t gMutex = nullptr;
@@ -543,6 +567,7 @@ void setup() {
   Hal::init();
 
   Serial.begin(115200);
+  Serial.println(F("BOOT: ESP32 firmware init"));
   const uint32_t t0 = millis();
   while (!Serial && (millis() - t0) < 3000u) {
     // espera corta opcional de puerto serial
